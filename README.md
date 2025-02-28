@@ -1,7 +1,7 @@
 # Unsplash Workers API
 
 ## Description
-Unsplash Workers API is a serverless API that allows you to interact with the Unsplash API using Cloudflare Workers. This project aims to provide a lightweight and efficient way to fetch and serve images from Unsplash, leveraging the power of serverless architecture.
+The Unsplash Workers API is a serverless API built with Cloudflare Workers that allows you to efficiently fetch and serve images from Unsplash.
 
 ## Features
 - Fetch random images from Unsplash
