@@ -13,7 +13,7 @@ The Unsplash Workers API is a serverless API built with Cloudflare Workers that 
 
 To deploy the Unsplash Workers API, click the button below:
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button.svg)](https://cloudflare.com/workers)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nazdridoy/unsplash-workers-api)
 
 ### API Endpoints
 
