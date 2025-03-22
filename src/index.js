@@ -11,8 +11,6 @@ async function handleRequest(request, event) {
         return handleRandomRequest(url, event);
     } else if (url.pathname === '/cache-status') {
         return handleCacheStatusRequest();
-    } else if (url.pathname === '/metrics') {
-        return handleMetricsRequest();
     } else {
         return new Response('Not Found', { status: 404 });
     }
@@ -54,9 +52,6 @@ async function handleRandomRequest(url, event) {
         // Get or initialize metadata for this cache key
         let metadata = await getOrInitializeMetadata(cacheKey);
         
-        // Track request in metrics
-        updateMetrics('totalRequests', cacheKey);
-        
         // OPERATION PATTERN 1: Main cache has images - use it directly
         if (metadata.mainCache.count > 0 && !params.noCache) {
             const cacheResult = await getImageFromCache(metadata, params, 'main', cacheKey);
@@ -65,11 +60,7 @@ async function handleRandomRequest(url, event) {
                 // Track download in background if needed
                 if (params.download) {
                     event.waitUntil(trackDownload(cacheResult.imageData.id));
-                    updateMetrics('downloads', cacheKey);
                 }
-                
-                updateMetrics('cacheHits', cacheKey);
-                updateMetrics('mainCacheHits', cacheKey);
                 
                 // If metadata changed, update it
                 if (cacheResult.metadataChanged) {
@@ -100,11 +91,7 @@ async function handleRandomRequest(url, event) {
                 // Track download in background if needed
                 if (params.download) {
                     event.waitUntil(trackDownload(cacheResult.imageData.id));
-                    updateMetrics('downloads', cacheKey);
                 }
-                
-                updateMetrics('cacheHits', cacheKey);
-                updateMetrics('mainCacheHits', cacheKey);
                 
                 // If metadata changed, update it
                 if (cacheResult.metadataChanged) {
@@ -120,20 +107,13 @@ async function handleRandomRequest(url, event) {
         
         // OPERATION PATTERN 3: COLD START or CACHE MISS - both caches empty
         console.log(`Cache miss or cold start for key ${cacheKey} - using direct API`);
-        updateMetrics('cacheMisses', cacheKey);
-        
-        if (metadata.mainCache.count === 0 && metadata.bufferCache.count === 0) {
-            updateMetrics('coldStarts', cacheKey);
-        }
         
         // Fetch directly from Unsplash API
-        updateMetrics('apiCalls', cacheKey);
         const imageData = await fetchImageFromUnsplash(params);
         
         // Track download if needed
         if (params.download) {
             event.waitUntil(trackDownload(imageData.id));
-            updateMetrics('downloads', cacheKey);
         }
         
         // If both caches are empty, trigger refill in background
@@ -149,7 +129,6 @@ async function handleRandomRequest(url, event) {
         return formatResponse(imageData, params);
     } catch (error) {
         console.error(`Error in worker: ${error.message}`);
-        updateMetrics('errors', cacheKey);
         
         // Determine appropriate status code
         let status = 500;
@@ -285,18 +264,7 @@ async function getOrInitializeMetadata(cacheKey = 'default') {
             },
             isRefilling: false,
             lastRefillTime: 0,
-            cacheKey: cacheKey,    // Store which cache key this belongs to
-            metrics: {
-                totalRequests: 0,
-                cacheHits: 0,
-                cacheMisses: 0,
-                mainCacheHits: 0,
-                bufferCacheHits: 0,
-                apiCalls: 0,
-                downloads: 0,
-                errors: 0,
-                coldStarts: 0
-            }
+            cacheKey: cacheKey     // Store which cache key this belongs to
         };
         
         // Initialize empty caches for this key
@@ -447,7 +415,6 @@ async function refillBufferCache(metadata, cacheKey = 'default', params = {}) {
         }
         
         const fullImages = await response.json();
-        updateMetrics('apiCalls', cacheKey);
         
         // If we got no images back (rare but possible), mark as not refilling and return
         if (!Array.isArray(fullImages) || fullImages.length === 0) {
@@ -650,51 +617,6 @@ function sanitizeNumber(value) {
     return isNaN(num) ? null : num.toString();
 }
 
-// Update metrics with batching to reduce KV operations
-let metricsUpdateQueue = {};
-let metricsUpdateTimer = null;
-
-// Update metrics with batching - fixed to work with parameter-aware caching
-async function updateMetrics(metricName, cacheKey = 'default') {
-    // Queue updates by cache key
-    if (!metricsUpdateQueue[cacheKey]) {
-        metricsUpdateQueue[cacheKey] = {};
-    }
-    
-    // Add to queue for this cache key
-    metricsUpdateQueue[cacheKey][metricName] = (metricsUpdateQueue[cacheKey][metricName] || 0) + 1;
-    
-    // If timer not set, set one to process queue
-    if (!metricsUpdateTimer) {
-        metricsUpdateTimer = setTimeout(async () => {
-            try {
-                // Process each cache key's metrics separately
-                for (const [key, metrics] of Object.entries(metricsUpdateQueue)) {
-                    const metadata = await getOrInitializeMetadata(key);
-                    
-                    // Apply all queued updates for this cache key
-                    for (const [metric, count] of Object.entries(metrics)) {
-                        if (metadata.metrics && metadata.metrics[metric] !== undefined) {
-                            metadata.metrics[metric] += count;
-                        }
-                    }
-                    
-                    // Save updated metadata for this cache key
-                    await updateMetadata(metadata, key);
-                }
-                
-                // Clear queue and timer
-                metricsUpdateQueue = {};
-                metricsUpdateTimer = null;
-            } catch (error) {
-                console.error(`Batch metrics update error: ${error.message}`);
-                // Clear timer but keep queue for retry
-                metricsUpdateTimer = null;
-            }
-        }, 2000); // Batch updates every 2 seconds
-    }
-}
-
 // API Endpoints
 // -----------------------------------------------------------
 
@@ -735,78 +657,6 @@ async function handleCacheStatusRequest() {
         }
         
         return new Response(JSON.stringify(cacheStatuses, null, 2), {
-            headers: { 'Content-Type': 'application/json' }
-        });
-    } catch (error) {
-        return new Response(`Error: ${error.message}`, { status: 500 });
-    }
-}
-
-// Handle metrics request
-async function handleMetricsRequest() {
-    try {
-        // Get list of all cache keys from KV store
-        const keys = await NAZKVHUBSTORE.list({ prefix: 'META_' });
-        
-        const allMetrics = {};
-        let globalMetrics = {
-            totalRequests: 0,
-            cacheHits: 0,
-            cacheMisses: 0,
-            mainCacheHits: 0,
-            bufferCacheHits: 0,
-            apiCalls: 0,
-            downloads: 0,
-            errors: 0,
-            coldStarts: 0
-        };
-        
-        // Process each cache
-        for (const key of keys.keys) {
-            const cacheKey = key.name.replace('META_', '');
-            const metadata = await getOrInitializeMetadata(cacheKey);
-            
-            // Calculate derived metrics for this cache
-            const cacheHitRate = metadata.metrics.totalRequests > 0 
-                ? Math.round((metadata.metrics.cacheHits / metadata.metrics.totalRequests) * 100)
-                : 0;
-            
-            const cacheMetrics = {
-                ...metadata.metrics,
-                cacheHitRate: `${cacheHitRate}%`,
-                averageApiCallsPerRequest: metadata.metrics.totalRequests > 0
-                    ? (metadata.metrics.apiCalls / metadata.metrics.totalRequests).toFixed(4)
-                    : 0
-            };
-            
-            // Add to per-cache metrics
-            allMetrics[cacheKey] = cacheMetrics;
-            
-            // Add to global totals
-            for (const [metric, value] of Object.entries(metadata.metrics)) {
-                if (typeof value === 'number' && globalMetrics[metric] !== undefined) {
-                    globalMetrics[metric] += value;
-                }
-            }
-        }
-        
-        // Calculate global derived metrics
-        const globalHitRate = globalMetrics.totalRequests > 0 
-            ? Math.round((globalMetrics.cacheHits / globalMetrics.totalRequests) * 100)
-            : 0;
-            
-        globalMetrics.cacheHitRate = `${globalHitRate}%`;
-        globalMetrics.averageApiCallsPerRequest = globalMetrics.totalRequests > 0
-            ? (globalMetrics.apiCalls / globalMetrics.totalRequests).toFixed(4)
-            : 0;
-            
-        // Build final response with global and per-cache metrics
-        const response = {
-            global: globalMetrics,
-            perCache: allMetrics
-        };
-        
-        return new Response(JSON.stringify(response, null, 2), {
             headers: { 'Content-Type': 'application/json' }
         });
     } catch (error) {
