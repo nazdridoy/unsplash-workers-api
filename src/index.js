@@ -48,35 +48,38 @@ async function handleRandomRequest(url, event) {
             return new Response('Invalid image type. Supported types: full, regular, small, thumb, raw', { status: 400 });
         }
         
-        // Get or initialize metadata
-        let metadata = await getOrInitializeMetadata();
+        // Generate cache key for this parameter combination
+        const cacheKey = generateCacheKey(params);
+        
+        // Get or initialize metadata for this cache key
+        let metadata = await getOrInitializeMetadata(cacheKey);
         
         // Track request in metrics
-        updateMetrics('totalRequests');
+        updateMetrics('totalRequests', cacheKey);
         
         // OPERATION PATTERN 1: Main cache has images - use it directly
         if (metadata.mainCache.count > 0 && !params.noCache) {
-            const cacheResult = await getImageFromCache(metadata, params, 'main');
+            const cacheResult = await getImageFromCache(metadata, params, 'main', cacheKey);
             
             if (cacheResult.imageData) {
                 // Track download in background if needed
                 if (params.download) {
                     event.waitUntil(trackDownload(cacheResult.imageData.id));
-                    updateMetrics('downloads');
+                    updateMetrics('downloads', cacheKey);
                 }
                 
-                updateMetrics('cacheHits');
-                updateMetrics('mainCacheHits');
+                updateMetrics('cacheHits', cacheKey);
+                updateMetrics('mainCacheHits', cacheKey);
                 
                 // If metadata changed, update it
                 if (cacheResult.metadataChanged) {
-                    await updateMetadata(metadata);
+                    await updateMetadata(metadata, cacheKey);
                 }
                 
                 // Check if main cache is now empty after this request
                 if (metadata.mainCache.count === 0 && metadata.bufferCache.count > 0) {
                     // Refill main from buffer in background 
-                    event.waitUntil(refillCacheSystem(metadata));
+                    event.waitUntil(refillCacheSystem(metadata, cacheKey, params));
                 }
                 
                 return formatResponse(cacheResult.imageData, params);
@@ -85,68 +88,68 @@ async function handleRandomRequest(url, event) {
         
         // OPERATION PATTERN 2: Main cache empty but buffer has images
         if (metadata.mainCache.count === 0 && metadata.bufferCache.count > 0 && !params.noCache) {
-            console.log("Main cache empty - copying buffer to main for immediate use");
+            console.log(`Main cache empty for key ${cacheKey} - copying buffer to main for immediate use`);
             
             // Copy buffer to main immediately to serve this request
-            await copyBufferToMain(metadata);
+            await copyBufferToMain(metadata, cacheKey);
             
             // Now try to get image from the newly filled main cache
-            const cacheResult = await getImageFromCache(metadata, params, 'main');
+            const cacheResult = await getImageFromCache(metadata, params, 'main', cacheKey);
             
             if (cacheResult.imageData) {
                 // Track download in background if needed
                 if (params.download) {
                     event.waitUntil(trackDownload(cacheResult.imageData.id));
-                    updateMetrics('downloads');
+                    updateMetrics('downloads', cacheKey);
                 }
                 
-                updateMetrics('cacheHits');
-                updateMetrics('mainCacheHits');
+                updateMetrics('cacheHits', cacheKey);
+                updateMetrics('mainCacheHits', cacheKey);
                 
                 // If metadata changed, update it
                 if (cacheResult.metadataChanged) {
-                    await updateMetadata(metadata);
+                    await updateMetadata(metadata, cacheKey);
                 }
                 
                 // Start buffer refill in background
-                event.waitUntil(refillBufferCache(metadata));
+                event.waitUntil(refillBufferCache(metadata, cacheKey, params));
                 
                 return formatResponse(cacheResult.imageData, params);
             }
         }
         
         // OPERATION PATTERN 3: COLD START or CACHE MISS - both caches empty
-        console.log("Cache miss or cold start - using direct API");
-        updateMetrics('cacheMisses');
+        console.log(`Cache miss or cold start for key ${cacheKey} - using direct API`);
+        updateMetrics('cacheMisses', cacheKey);
         
         if (metadata.mainCache.count === 0 && metadata.bufferCache.count === 0) {
-            updateMetrics('coldStarts');
+            updateMetrics('coldStarts', cacheKey);
         }
         
         // Fetch directly from Unsplash API
-        updateMetrics('apiCalls');
+        updateMetrics('apiCalls', cacheKey);
         const imageData = await fetchImageFromUnsplash(params);
         
         // Track download if needed
         if (params.download) {
             event.waitUntil(trackDownload(imageData.id));
-            updateMetrics('downloads');
+            updateMetrics('downloads', cacheKey);
         }
         
         // If both caches are empty, trigger refill in background
         if (metadata.mainCache.count === 0 && metadata.bufferCache.count === 0) {
-            event.waitUntil(refillBufferCache(metadata).then(async (updatedMeta) => {
+            event.waitUntil(refillBufferCache(metadata, cacheKey, params).then(async (updatedMeta) => {
                 // After buffer is refilled, copy buffer to main
-                await copyBufferToMain(updatedMeta);
+                await copyBufferToMain(updatedMeta, cacheKey);
                 // Refill buffer again
-                await refillBufferCache(updatedMeta);
+                await refillBufferCache(updatedMeta, cacheKey, params);
             }));
         }
         
         return formatResponse(imageData, params);
     } catch (error) {
         console.error(`Error in worker: ${error.message}`);
-        updateMetrics('errors');
+        updateMetrics('errors', cacheKey);
         
         // Determine appropriate status code
         let status = 500;
@@ -234,12 +237,42 @@ function formatResponse(imageData, params) {
 // Cache Management System
 // -----------------------------------------------------------
 
-// Get or initialize cache metadata
-async function getOrInitializeMetadata() {
-    let metadata = await NAZKVHUBSTORE.get('STOREMETA', { type: 'json' });
+// Generate a consistent, normalized cache key from parameters
+function generateCacheKey(params) {
+    // Include only the parameters that affect the content of images
+    const relevantParams = {
+        orientation: params.orientation || 'default',
+        collectionIds: params.collectionIds || 'none',
+        addPhotoOfTheDay: params.addPhotoOfTheDay || false
+    };
+    
+    // Sort keys to ensure consistent order
+    const sortedKeys = Object.keys(relevantParams).sort();
+    
+    // Build key-value pairs and join them
+    const keyParts = sortedKeys.map(key => {
+        const value = relevantParams[key];
+        // Skip default/empty values to make keys more concise
+        if (value === 'none' || value === false || value === 'default') {
+            return null;
+        }
+        return `${key}=${value}`;
+    }).filter(part => part !== null);
+    
+    // Create the final key, defaulting to 'default' if no parameters
+    const finalKey = keyParts.length > 0 ? keyParts.join('_') : 'default';
+    
+    console.log(`Generated cache key: ${finalKey}`);
+    return finalKey;
+}
+
+// Get or initialize cache metadata with parameter awareness
+async function getOrInitializeMetadata(cacheKey = 'default') {
+    const metaKey = `META_${cacheKey}`;
+    let metadata = await NAZKVHUBSTORE.get(metaKey, { type: 'json' });
     
     if (!metadata) {
-        console.log("Initializing fresh metadata");
+        console.log(`Initializing fresh metadata for cache key: ${cacheKey}`);
         
         metadata = {
             mainCache: {
@@ -252,6 +285,7 @@ async function getOrInitializeMetadata() {
             },
             isRefilling: false,
             lastRefillTime: 0,
+            cacheKey: cacheKey,    // Store which cache key this belongs to
             metrics: {
                 totalRequests: 0,
                 cacheHits: 0,
@@ -265,24 +299,25 @@ async function getOrInitializeMetadata() {
             }
         };
         
-        // Initialize empty caches
-        await NAZKVHUBSTORE.put('MAINCACHE', JSON.stringify(Array(30).fill(null)));
-        await NAZKVHUBSTORE.put('BUFFERCACHE', JSON.stringify(Array(30).fill(null)));
-        await updateMetadata(metadata);
+        // Initialize empty caches for this key
+        await NAZKVHUBSTORE.put(`MAIN_${cacheKey}`, JSON.stringify(Array(30).fill(null)));
+        await NAZKVHUBSTORE.put(`BUFFER_${cacheKey}`, JSON.stringify(Array(30).fill(null)));
+        await updateMetadata(metadata, cacheKey);
     }
     
     return metadata;
 }
 
-// Update metadata in KV store
-async function updateMetadata(metadata) {
-    return NAZKVHUBSTORE.put('STOREMETA', JSON.stringify(metadata));
+// Update metadata in KV store with parameter awareness
+async function updateMetadata(metadata, cacheKey = 'default') {
+    const metaKey = `META_${cacheKey}`;
+    return NAZKVHUBSTORE.put(metaKey, JSON.stringify(metadata));
 }
 
-// Get image from specific cache using pointer-based approach
-async function getImageFromCache(metadata, params, cacheType = 'main') {
+// Get image from specific cache using pointer-based approach with parameter awareness
+async function getImageFromCache(metadata, params, cacheType = 'main', cacheKey = 'default') {
     const cache = cacheType === 'main' ? metadata.mainCache : metadata.bufferCache;
-    const cacheKey = cacheType === 'main' ? 'MAINCACHE' : 'BUFFERCACHE';
+    const cacheStorageKey = cacheType === 'main' ? `MAIN_${cacheKey}` : `BUFFER_${cacheKey}`;
     
     // No images in this cache
     if (cache.count === 0) {
@@ -290,96 +325,114 @@ async function getImageFromCache(metadata, params, cacheType = 'main') {
     }
     
     // Get the entire cache array with one operation
-    const cacheArray = await NAZKVHUBSTORE.get(cacheKey, { type: 'json' });
+    const cacheArray = await NAZKVHUBSTORE.get(cacheStorageKey, { type: 'json' });
     if (!cacheArray) {
         // Cache should exist but doesn't - recreate it
-        await NAZKVHUBSTORE.put(cacheKey, JSON.stringify(Array(30).fill(null)));
+        await NAZKVHUBSTORE.put(cacheStorageKey, JSON.stringify(Array(30).fill(null)));
         cache.count = 0;
         return { imageData: null, metadataChanged: true };
     }
     
-    const { orientation, collectionIds, addPhotoOfTheDay } = params;
-    let checkedCount = 0;
+    // Since we're using parameter-specific caches, we can simplify this function
+    // We don't need to check criteria again - just find any non-null entry
     let foundIndex = -1;
+    let startPointer = cache.currentPointer;
+    let loopCount = 0;
     
-    // Search through available images using pointer
-    while (checkedCount < cache.count) {
+    // Look for any valid image in the cache
+    while (loopCount < 30) {  // Maximum 30 slots to check
         // Move pointer to next position
         cache.currentPointer = (cache.currentPointer + 1) % 30;
         
         // Check if this slot has an image
-        if (cacheArray[cache.currentPointer]) {
-            checkedCount++;
-            
-            // Check if image matches criteria
-            if (matchesCriteria(cacheArray[cache.currentPointer], orientation, collectionIds, addPhotoOfTheDay)) {
-                foundIndex = cache.currentPointer;
-                break;
-            }
+        if (cacheArray[cache.currentPointer] !== null) {
+            foundIndex = cache.currentPointer;
+            break;
+        }
+        
+        loopCount++;
+        
+        // If we've checked all positions and found nothing
+        if (cache.currentPointer === startPointer) {
+            break;
         }
     }
     
-    // No matching image found
+    // No image found
     if (foundIndex === -1) {
+        console.log(`No images found in ${cacheType} cache for key ${cacheKey} despite count=${cache.count}`);
+        // Update count to match reality
+        cache.count = 0;
         return { imageData: null, metadataChanged: true };
     }
     
-    // Found a matching image - get it and clear the slot
+    // Found an image - get it and clear the slot
     const imageData = cacheArray[foundIndex];
     cacheArray[foundIndex] = null;
     cache.count--;
     
     // Update the cache with one operation
-    await NAZKVHUBSTORE.put(cacheKey, JSON.stringify(cacheArray));
+    await NAZKVHUBSTORE.put(cacheStorageKey, JSON.stringify(cacheArray));
     
     return { imageData, metadataChanged: true };
 }
 
 // Copy entire buffer cache to main cache - SYNCHRONOUS OPERATION
-async function copyBufferToMain(metadata) {
-    console.log("Copying buffer to main cache");
+async function copyBufferToMain(metadata, cacheKey = 'default') {
+    console.log(`Copying buffer to main cache for key: ${cacheKey}`);
     
     try {
-        // Get both caches with minimal operations
-        const bufferArray = await NAZKVHUBSTORE.get('BUFFERCACHE', { type: 'json' });
+        // Get buffer cache with minimal operations
+        const bufferArray = await NAZKVHUBSTORE.get(`BUFFER_${cacheKey}`, { type: 'json' });
         
         if (!bufferArray) {
-            throw new Error('Buffer cache not found');
+            throw new Error(`Buffer cache not found for key: ${cacheKey}`);
         }
         
         // Copy buffer to main directly
-        await NAZKVHUBSTORE.put('MAINCACHE', JSON.stringify(bufferArray));
+        await NAZKVHUBSTORE.put(`MAIN_${cacheKey}`, JSON.stringify(bufferArray));
         
         // Update metadata
         metadata.mainCache.count = metadata.bufferCache.count;
         metadata.mainCache.currentPointer = 0;  // Reset pointer for fresh access
-        await updateMetadata(metadata);
+        await updateMetadata(metadata, cacheKey);
         
-        console.log(`Buffer copy complete. Main cache now has ${metadata.mainCache.count} images`);
+        console.log(`Buffer copy complete for key ${cacheKey}. Main cache now has ${metadata.mainCache.count} images`);
         return metadata;
     } catch (error) {
-        console.error(`Error copying buffer to main: ${error.message}`);
+        console.error(`Error copying buffer to main for key ${cacheKey}: ${error.message}`);
         throw error;
     }
 }
 
 // Refill buffer cache with new images - ASYNCHRONOUS OPERATION
-async function refillBufferCache(metadata) {
-    console.log("Refilling buffer cache");
+async function refillBufferCache(metadata, cacheKey = 'default', params = {}) {
+    console.log(`Refilling buffer cache for key: ${cacheKey}`);
     
     if (metadata.isRefilling) {
-        console.log("Refill already in progress, skipping");
+        console.log(`Refill already in progress for key: ${cacheKey}, skipping`);
         return metadata;
     }
     
     try {
         // Mark refill in progress
         metadata.isRefilling = true;
-        await updateMetadata(metadata);
+        await updateMetadata(metadata, cacheKey);
         
         // Fetch images in bulk (30 at once)
         const fetchUrl = new URL('https://api.unsplash.com/photos/random');
         fetchUrl.searchParams.append('count', '30');
+        
+        // Add parameters that affect the content
+        if (params.orientation) {
+            fetchUrl.searchParams.append('orientation', params.orientation);
+        }
+        
+        if (params.addPhotoOfTheDay) {
+            fetchUrl.searchParams.append('collections', '1459961'); // Photo of the day collection ID
+        } else if (params.collectionIds) {
+            fetchUrl.searchParams.append('collections', params.collectionIds);
+        }
         
         // Make the API request
         const response = await fetch(fetchUrl.toString(), {
@@ -394,7 +447,15 @@ async function refillBufferCache(metadata) {
         }
         
         const fullImages = await response.json();
-        updateMetrics('apiCalls');
+        updateMetrics('apiCalls', cacheKey);
+        
+        // If we got no images back (rare but possible), mark as not refilling and return
+        if (!Array.isArray(fullImages) || fullImages.length === 0) {
+            console.log(`No images returned from API for key: ${cacheKey}`);
+            metadata.isRefilling = false;
+            await updateMetadata(metadata, cacheKey);
+            return metadata;
+        }
         
         // Process and optimize the images to store only what's needed
         const optimizedImages = fullImages.map(img => ({
@@ -407,44 +468,44 @@ async function refillBufferCache(metadata) {
             width: img.width,
             height: img.height,
             description: img.description || img.alt_description,
-            current_user_collections: img.current_user_collections
+            current_user_collections: img.current_user_collections || []
         }));
         
         // Update buffer cache with one operation
-        await NAZKVHUBSTORE.put('BUFFERCACHE', JSON.stringify(optimizedImages));
+        await NAZKVHUBSTORE.put(`BUFFER_${cacheKey}`, JSON.stringify(optimizedImages));
         
         // Update metadata
-        metadata.bufferCache.count = 30;
+        metadata.bufferCache.count = optimizedImages.length;
         metadata.bufferCache.currentPointer = 0;
         metadata.isRefilling = false;
         metadata.lastRefillTime = Date.now();
-        await updateMetadata(metadata);
+        await updateMetadata(metadata, cacheKey);
         
-        console.log("Buffer refill complete");
+        console.log(`Buffer refill complete for key: ${cacheKey}, filled with ${optimizedImages.length} images`);
         return metadata;
     } catch (error) {
         // Reset refill flag on error
         metadata.isRefilling = false;
-        await updateMetadata(metadata);
-        console.error(`Refill error: ${error.message}`);
+        await updateMetadata(metadata, cacheKey);
+        console.error(`Refill error for key ${cacheKey}: ${error.message}`);
         throw error;
     }
 }
 
 // Helper function to trigger full cache system refresh - ASYNCHRONOUS OPERATION
-async function refillCacheSystem(metadata) {
+async function refillCacheSystem(metadata, cacheKey = 'default', params = {}) {
     try {
-        console.log("Triggering full cache system refresh");
+        console.log(`Triggering full cache system refresh for key: ${cacheKey}`);
         
         // First copy buffer to main
-        await copyBufferToMain(metadata);
+        await copyBufferToMain(metadata, cacheKey);
         
         // Then refill buffer
-        await refillBufferCache(metadata);
+        await refillBufferCache(metadata, cacheKey, params);
         
         return metadata;
     } catch (error) {
-        console.error(`Cache system refresh error: ${error.message}`);
+        console.error(`Cache system refresh error for key ${cacheKey}: ${error.message}`);
         throw error;
     }
 }
@@ -465,7 +526,7 @@ function matchesCriteria(imageData, orientation, collectionIds, addPhotoOfTheDay
         // Check if image belongs to any of the specified collections
         const imageCollections = imageData.current_user_collections || [];
         const collectionMatch = imageCollections.some(collection => 
-            collectionIdArray.includes(collection.id.toString())
+            collectionIdArray.includes(String(collection.id))
         );
         
         if (!collectionMatch) return false;
@@ -475,7 +536,7 @@ function matchesCriteria(imageData, orientation, collectionIds, addPhotoOfTheDay
     if (addPhotoOfTheDay) {
         const imageCollections = imageData.current_user_collections || [];
         const isPotd = imageCollections.some(collection => 
-            collection.id.toString() === '1459961' // Photo of the day collection ID
+            String(collection.id) === '1459961' // Photo of the day collection ID
         );
         
         if (!isPotd) return false;
@@ -593,26 +654,34 @@ function sanitizeNumber(value) {
 let metricsUpdateQueue = {};
 let metricsUpdateTimer = null;
 
-// Update metrics with batching
-async function updateMetrics(metricName) {
-    // Add to queue
-    metricsUpdateQueue[metricName] = (metricsUpdateQueue[metricName] || 0) + 1;
+// Update metrics with batching - fixed to work with parameter-aware caching
+async function updateMetrics(metricName, cacheKey = 'default') {
+    // Queue updates by cache key
+    if (!metricsUpdateQueue[cacheKey]) {
+        metricsUpdateQueue[cacheKey] = {};
+    }
+    
+    // Add to queue for this cache key
+    metricsUpdateQueue[cacheKey][metricName] = (metricsUpdateQueue[cacheKey][metricName] || 0) + 1;
     
     // If timer not set, set one to process queue
     if (!metricsUpdateTimer) {
         metricsUpdateTimer = setTimeout(async () => {
             try {
-                const metadata = await getOrInitializeMetadata();
-                
-                // Apply all queued updates
-                for (const [metric, count] of Object.entries(metricsUpdateQueue)) {
-                    if (metadata.metrics && metadata.metrics[metric] !== undefined) {
-                        metadata.metrics[metric] += count;
+                // Process each cache key's metrics separately
+                for (const [key, metrics] of Object.entries(metricsUpdateQueue)) {
+                    const metadata = await getOrInitializeMetadata(key);
+                    
+                    // Apply all queued updates for this cache key
+                    for (const [metric, count] of Object.entries(metrics)) {
+                        if (metadata.metrics && metadata.metrics[metric] !== undefined) {
+                            metadata.metrics[metric] += count;
+                        }
                     }
+                    
+                    // Save updated metadata for this cache key
+                    await updateMetadata(metadata, key);
                 }
-                
-                // Save updated metadata
-                await updateMetadata(metadata);
                 
                 // Clear queue and timer
                 metricsUpdateQueue = {};
@@ -629,33 +698,43 @@ async function updateMetrics(metricName) {
 // API Endpoints
 // -----------------------------------------------------------
 
-// Handle cache status request
+// Handle cache status request - updated for parameter awareness
 async function handleCacheStatusRequest() {
     try {
-        const metadata = await getOrInitializeMetadata();
+        // Get list of all cache keys from KV store
+        // Note: This is a simplification - in practice you'd need pagination for many keys
+        const keys = await NAZKVHUBSTORE.list({ prefix: 'META_' });
         
-        // Calculate cache fill percentages
-        const mainFillPercent = Math.round((metadata.mainCache.count / 30) * 100);
-        const bufferFillPercent = Math.round((metadata.bufferCache.count / 30) * 100);
+        const cacheStatuses = {};
         
-        // Format response
-        const status = {
-            mainCache: {
-                images: metadata.mainCache.count,
-                fillPercent: mainFillPercent,
-                currentPointer: metadata.mainCache.currentPointer
-            },
-            bufferCache: {
-                images: metadata.bufferCache.count,
-                fillPercent: bufferFillPercent,
-                currentPointer: metadata.bufferCache.currentPointer
-            },
-            isRefilling: metadata.isRefilling,
-            lastRefillTime: metadata.lastRefillTime,
-            lastRefreshRelative: metadata.lastRefillTime ? `${Math.round((Date.now() - metadata.lastRefillTime) / 1000 / 60)} minutes ago` : 'never'
-        };
+        // Process each cache
+        for (const key of keys.keys) {
+            const cacheKey = key.name.replace('META_', '');
+            const metadata = await getOrInitializeMetadata(cacheKey);
+            
+            // Calculate cache fill percentages
+            const mainFillPercent = Math.round((metadata.mainCache.count / 30) * 100);
+            const bufferFillPercent = Math.round((metadata.bufferCache.count / 30) * 100);
+            
+            // Format status for this cache
+            cacheStatuses[cacheKey] = {
+                mainCache: {
+                    images: metadata.mainCache.count,
+                    fillPercent: mainFillPercent,
+                    currentPointer: metadata.mainCache.currentPointer
+                },
+                bufferCache: {
+                    images: metadata.bufferCache.count,
+                    fillPercent: bufferFillPercent,
+                    currentPointer: metadata.bufferCache.currentPointer
+                },
+                isRefilling: metadata.isRefilling,
+                lastRefillTime: metadata.lastRefillTime,
+                lastRefreshRelative: metadata.lastRefillTime ? `${Math.round((Date.now() - metadata.lastRefillTime) / 1000 / 60)} minutes ago` : 'never'
+            };
+        }
         
-        return new Response(JSON.stringify(status, null, 2), {
+        return new Response(JSON.stringify(cacheStatuses, null, 2), {
             headers: { 'Content-Type': 'application/json' }
         });
     } catch (error) {
@@ -666,25 +745,100 @@ async function handleCacheStatusRequest() {
 // Handle metrics request
 async function handleMetricsRequest() {
     try {
-        const metadata = await getOrInitializeMetadata();
+        // Get list of all cache keys from KV store
+        const keys = await NAZKVHUBSTORE.list({ prefix: 'META_' });
         
-        // Calculate some derived metrics
-        const cacheHitRate = metadata.metrics.totalRequests > 0 
-            ? Math.round((metadata.metrics.cacheHits / metadata.metrics.totalRequests) * 100)
-            : 0;
-        
-        const metrics = {
-            ...metadata.metrics,
-            cacheHitRate: `${cacheHitRate}%`,
-            averageApiCallsPerRequest: metadata.metrics.totalRequests > 0
-                ? (metadata.metrics.apiCalls / metadata.metrics.totalRequests).toFixed(4)
-                : 0
+        const allMetrics = {};
+        let globalMetrics = {
+            totalRequests: 0,
+            cacheHits: 0,
+            cacheMisses: 0,
+            mainCacheHits: 0,
+            bufferCacheHits: 0,
+            apiCalls: 0,
+            downloads: 0,
+            errors: 0,
+            coldStarts: 0
         };
         
-        return new Response(JSON.stringify(metrics, null, 2), {
+        // Process each cache
+        for (const key of keys.keys) {
+            const cacheKey = key.name.replace('META_', '');
+            const metadata = await getOrInitializeMetadata(cacheKey);
+            
+            // Calculate derived metrics for this cache
+            const cacheHitRate = metadata.metrics.totalRequests > 0 
+                ? Math.round((metadata.metrics.cacheHits / metadata.metrics.totalRequests) * 100)
+                : 0;
+            
+            const cacheMetrics = {
+                ...metadata.metrics,
+                cacheHitRate: `${cacheHitRate}%`,
+                averageApiCallsPerRequest: metadata.metrics.totalRequests > 0
+                    ? (metadata.metrics.apiCalls / metadata.metrics.totalRequests).toFixed(4)
+                    : 0
+            };
+            
+            // Add to per-cache metrics
+            allMetrics[cacheKey] = cacheMetrics;
+            
+            // Add to global totals
+            for (const [metric, value] of Object.entries(metadata.metrics)) {
+                if (typeof value === 'number' && globalMetrics[metric] !== undefined) {
+                    globalMetrics[metric] += value;
+                }
+            }
+        }
+        
+        // Calculate global derived metrics
+        const globalHitRate = globalMetrics.totalRequests > 0 
+            ? Math.round((globalMetrics.cacheHits / globalMetrics.totalRequests) * 100)
+            : 0;
+            
+        globalMetrics.cacheHitRate = `${globalHitRate}%`;
+        globalMetrics.averageApiCallsPerRequest = globalMetrics.totalRequests > 0
+            ? (globalMetrics.apiCalls / globalMetrics.totalRequests).toFixed(4)
+            : 0;
+            
+        // Build final response with global and per-cache metrics
+        const response = {
+            global: globalMetrics,
+            perCache: allMetrics
+        };
+        
+        return new Response(JSON.stringify(response, null, 2), {
             headers: { 'Content-Type': 'application/json' }
         });
     } catch (error) {
         return new Response(`Error: ${error.message}`, { status: 500 });
     }
 }
+
+// Add this helper function to inspect cache contents
+async function logCacheContents(cacheKey, cacheType = 'main') {
+    try {
+        const cacheStorageKey = cacheType === 'main' ? `MAIN_${cacheKey}` : `BUFFER_${cacheKey}`;
+        const cacheArray = await NAZKVHUBSTORE.get(cacheStorageKey, { type: 'json' });
+        
+        if (!cacheArray) {
+            console.log(`Cache ${cacheStorageKey} not found`);
+            return;
+        }
+        
+        const nonNullCount = cacheArray.filter(item => item !== null).length;
+        console.log(`Cache ${cacheStorageKey} contains ${nonNullCount} items (non-null)`);
+        
+        // Log a sample of IDs for debugging
+        const sampleIds = cacheArray
+            .filter(item => item !== null)
+            .slice(0, 5)
+            .map(item => item.id);
+            
+        console.log(`Sample image IDs: ${sampleIds.join(', ')}`);
+    } catch (error) {
+        console.error(`Error logging cache contents: ${error.message}`);
+    }
+}
+
+// Call this in key places, for example after refilling the buffer:
+// await logCacheContents(cacheKey, 'buffer');
