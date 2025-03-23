@@ -1,23 +1,26 @@
-addEventListener('fetch', event => {
-    event.respondWith(handleRequest(event.request, event));
-});
 
 // Main request handler
-async function handleRequest(request, event) {
+export default {
+  async fetch(request, env, ctx) {
+    return handleRequest(request, ctx, env);
+  }
+};
+
+async function handleRequest(request, ctx, env) {
     const url = new URL(request.url);
     
     // API endpoints
     if (url.pathname === '/random') {
-        return handleRandomRequest(url, event);
+        return handleRandomRequest(url, ctx, env);
     } else if (url.pathname === '/cache-status') {
-        return handleCacheStatusRequest();
+        return handleCacheStatusRequest(env);
     } else {
         return new Response('Not Found', { status: 404 });
     }
 }
 
 // Handle random image requests
-async function handleRandomRequest(url, event) {
+async function handleRandomRequest(url, ctx, env) {
     try {
         // Parse and validate parameters
         const params = {
@@ -50,27 +53,27 @@ async function handleRandomRequest(url, event) {
         const cacheKey = generateCacheKey(params);
         
         // Get or initialize metadata for this cache key
-        let metadata = await getOrInitializeMetadata(cacheKey);
+        let metadata = await getOrInitializeMetadata(cacheKey, env);
         
         // OPERATION PATTERN 1: Main cache has images - use it directly
         if (metadata.mainCache.count > 0 && !params.noCache) {
-            const cacheResult = await getImageFromCache(metadata, params, 'main', cacheKey);
+            const cacheResult = await getImageFromCache(metadata, params, 'main', cacheKey, env);
             
             if (cacheResult.imageData) {
                 // Track download in background if needed
                 if (params.download) {
-                    event.waitUntil(trackDownload(cacheResult.imageData.id));
+                    ctx.waitUntil(trackDownload(cacheResult.imageData.id, env));
                 }
                 
                 // If metadata changed, update it
                 if (cacheResult.metadataChanged) {
-                    await updateMetadata(metadata, cacheKey);
+                    await updateMetadata(metadata, cacheKey, env);
                 }
                 
                 // Check if main cache is now empty after this request
                 if (metadata.mainCache.count === 0 && metadata.bufferCache.count > 0) {
                     // Refill main from buffer in background 
-                    event.waitUntil(refillCacheSystem(metadata, cacheKey, params));
+                    ctx.waitUntil(refillCacheSystem(metadata, cacheKey, params, env));
                 }
                 
                 return formatResponse(cacheResult.imageData, params);
@@ -82,24 +85,24 @@ async function handleRandomRequest(url, event) {
             console.log(`Main cache empty for key ${cacheKey} - copying buffer to main for immediate use`);
             
             // Copy buffer to main immediately to serve this request
-            await copyBufferToMain(metadata, cacheKey);
+            await copyBufferToMain(metadata, cacheKey, env);
             
             // Now try to get image from the newly filled main cache
-            const cacheResult = await getImageFromCache(metadata, params, 'main', cacheKey);
+            const cacheResult = await getImageFromCache(metadata, params, 'main', cacheKey, env);
             
             if (cacheResult.imageData) {
                 // Track download in background if needed
                 if (params.download) {
-                    event.waitUntil(trackDownload(cacheResult.imageData.id));
+                    ctx.waitUntil(trackDownload(cacheResult.imageData.id, env));
                 }
                 
                 // If metadata changed, update it
                 if (cacheResult.metadataChanged) {
-                    await updateMetadata(metadata, cacheKey);
+                    await updateMetadata(metadata, cacheKey, env);
                 }
                 
                 // Start buffer refill in background
-                event.waitUntil(refillBufferCache(metadata, cacheKey, params));
+                ctx.waitUntil(refillBufferCache(metadata, cacheKey, params, env));
                 
                 return formatResponse(cacheResult.imageData, params);
             }
@@ -109,20 +112,20 @@ async function handleRandomRequest(url, event) {
         console.log(`Cache miss or cold start for key ${cacheKey} - using direct API`);
         
         // Fetch directly from Unsplash API
-        const imageData = await fetchImageFromUnsplash(params);
+        const imageData = await fetchImageFromUnsplash(params, env);
         
         // Track download if needed
         if (params.download) {
-            event.waitUntil(trackDownload(imageData.id));
+            ctx.waitUntil(trackDownload(imageData.id, env));
         }
         
         // If both caches are empty, trigger refill in background
         if (metadata.mainCache.count === 0 && metadata.bufferCache.count === 0) {
-            event.waitUntil(refillBufferCache(metadata, cacheKey, params).then(async (updatedMeta) => {
+            ctx.waitUntil(refillBufferCache(metadata, cacheKey, params, env).then(async (updatedMeta) => {
                 // After buffer is refilled, copy buffer to main
-                await copyBufferToMain(updatedMeta, cacheKey);
+                await copyBufferToMain(updatedMeta, cacheKey, env);
                 // Refill buffer again
-                await refillBufferCache(updatedMeta, cacheKey, params);
+                await refillBufferCache(updatedMeta, cacheKey, params, env);
             }));
         }
         
@@ -246,9 +249,9 @@ function generateCacheKey(params) {
 }
 
 // Get or initialize cache metadata with parameter awareness
-async function getOrInitializeMetadata(cacheKey = 'default') {
+async function getOrInitializeMetadata(cacheKey = 'default', env) {
     const metaKey = `META_${cacheKey}`;
-    let metadata = await NAZKVHUBSTORE.get(metaKey, { type: 'json' });
+    let metadata = await env.NAZKVHUBSTORE.get(metaKey, { type: 'json' });
     
     if (!metadata) {
         console.log(`Initializing fresh metadata for cache key: ${cacheKey}`);
@@ -268,22 +271,22 @@ async function getOrInitializeMetadata(cacheKey = 'default') {
         };
         
         // Initialize empty caches for this key
-        await NAZKVHUBSTORE.put(`MAIN_${cacheKey}`, JSON.stringify(Array(30).fill(null)));
-        await NAZKVHUBSTORE.put(`BUFFER_${cacheKey}`, JSON.stringify(Array(30).fill(null)));
-        await updateMetadata(metadata, cacheKey);
+        await env.NAZKVHUBSTORE.put(`MAIN_${cacheKey}`, JSON.stringify(Array(30).fill(null)));
+        await env.NAZKVHUBSTORE.put(`BUFFER_${cacheKey}`, JSON.stringify(Array(30).fill(null)));
+        await updateMetadata(metadata, cacheKey, env);
     }
     
     return metadata;
 }
 
 // Update metadata in KV store with parameter awareness
-async function updateMetadata(metadata, cacheKey = 'default') {
+async function updateMetadata(metadata, cacheKey = 'default', env) {
     const metaKey = `META_${cacheKey}`;
-    return NAZKVHUBSTORE.put(metaKey, JSON.stringify(metadata));
+    return env.NAZKVHUBSTORE.put(metaKey, JSON.stringify(metadata));
 }
 
 // Get image from specific cache using pointer-based approach with parameter awareness
-async function getImageFromCache(metadata, params, cacheType = 'main', cacheKey = 'default') {
+async function getImageFromCache(metadata, params, cacheType = 'main', cacheKey = 'default', env) {
     const cache = cacheType === 'main' ? metadata.mainCache : metadata.bufferCache;
     const cacheStorageKey = cacheType === 'main' ? `MAIN_${cacheKey}` : `BUFFER_${cacheKey}`;
     
@@ -293,10 +296,10 @@ async function getImageFromCache(metadata, params, cacheType = 'main', cacheKey 
     }
     
     // Get the entire cache array with one operation
-    const cacheArray = await NAZKVHUBSTORE.get(cacheStorageKey, { type: 'json' });
+    const cacheArray = await env.NAZKVHUBSTORE.get(cacheStorageKey, { type: 'json' });
     if (!cacheArray) {
         // Cache should exist but doesn't - recreate it
-        await NAZKVHUBSTORE.put(cacheStorageKey, JSON.stringify(Array(30).fill(null)));
+        await env.NAZKVHUBSTORE.put(cacheStorageKey, JSON.stringify(Array(30).fill(null)));
         cache.count = 0;
         return { imageData: null, metadataChanged: true };
     }
@@ -340,30 +343,30 @@ async function getImageFromCache(metadata, params, cacheType = 'main', cacheKey 
     cache.count--;
     
     // Update the cache with one operation
-    await NAZKVHUBSTORE.put(cacheStorageKey, JSON.stringify(cacheArray));
+    await env.NAZKVHUBSTORE.put(cacheStorageKey, JSON.stringify(cacheArray));
     
     return { imageData, metadataChanged: true };
 }
 
 // Copy entire buffer cache to main cache - SYNCHRONOUS OPERATION
-async function copyBufferToMain(metadata, cacheKey = 'default') {
+async function copyBufferToMain(metadata, cacheKey = 'default', env) {
     console.log(`Copying buffer to main cache for key: ${cacheKey}`);
     
     try {
         // Get buffer cache with minimal operations
-        const bufferArray = await NAZKVHUBSTORE.get(`BUFFER_${cacheKey}`, { type: 'json' });
+        const bufferArray = await env.NAZKVHUBSTORE.get(`BUFFER_${cacheKey}`, { type: 'json' });
         
         if (!bufferArray) {
             throw new Error(`Buffer cache not found for key: ${cacheKey}`);
         }
         
         // Copy buffer to main directly
-        await NAZKVHUBSTORE.put(`MAIN_${cacheKey}`, JSON.stringify(bufferArray));
+        await env.NAZKVHUBSTORE.put(`MAIN_${cacheKey}`, JSON.stringify(bufferArray));
         
         // Update metadata
         metadata.mainCache.count = metadata.bufferCache.count;
         metadata.mainCache.currentPointer = 0;  // Reset pointer for fresh access
-        await updateMetadata(metadata, cacheKey);
+        await updateMetadata(metadata, cacheKey, env);
         
         console.log(`Buffer copy complete for key ${cacheKey}. Main cache now has ${metadata.mainCache.count} images`);
         return metadata;
@@ -374,7 +377,7 @@ async function copyBufferToMain(metadata, cacheKey = 'default') {
 }
 
 // Refill buffer cache with new images - ASYNCHRONOUS OPERATION
-async function refillBufferCache(metadata, cacheKey = 'default', params = {}) {
+async function refillBufferCache(metadata, cacheKey = 'default', params = {}, env) {
     console.log(`Refilling buffer cache for key: ${cacheKey}`);
     
     if (metadata.isRefilling) {
@@ -385,7 +388,7 @@ async function refillBufferCache(metadata, cacheKey = 'default', params = {}) {
     try {
         // Mark refill in progress
         metadata.isRefilling = true;
-        await updateMetadata(metadata, cacheKey);
+        await updateMetadata(metadata, cacheKey, env);
         
         // Fetch images in bulk (30 at once)
         const fetchUrl = new URL('https://api.unsplash.com/photos/random');
@@ -405,7 +408,7 @@ async function refillBufferCache(metadata, cacheKey = 'default', params = {}) {
         // Make the API request
         const response = await fetch(fetchUrl.toString(), {
             headers: {
-                'Authorization': `Client-ID ${ACCESS_KEY}`,
+                'Authorization': `Client-ID ${env.ACCESS_KEY}`,
                 'Accept-Version': 'v1'
             }
         });
@@ -420,7 +423,7 @@ async function refillBufferCache(metadata, cacheKey = 'default', params = {}) {
         if (!Array.isArray(fullImages) || fullImages.length === 0) {
             console.log(`No images returned from API for key: ${cacheKey}`);
             metadata.isRefilling = false;
-            await updateMetadata(metadata, cacheKey);
+            await updateMetadata(metadata, cacheKey, env);
             return metadata;
         }
         
@@ -439,36 +442,36 @@ async function refillBufferCache(metadata, cacheKey = 'default', params = {}) {
         }));
         
         // Update buffer cache with one operation
-        await NAZKVHUBSTORE.put(`BUFFER_${cacheKey}`, JSON.stringify(optimizedImages));
+        await env.NAZKVHUBSTORE.put(`BUFFER_${cacheKey}`, JSON.stringify(optimizedImages));
         
         // Update metadata
         metadata.bufferCache.count = optimizedImages.length;
         metadata.bufferCache.currentPointer = 0;
         metadata.isRefilling = false;
         metadata.lastRefillTime = Date.now();
-        await updateMetadata(metadata, cacheKey);
+        await updateMetadata(metadata, cacheKey, env);
         
         console.log(`Buffer refill complete for key: ${cacheKey}, filled with ${optimizedImages.length} images`);
         return metadata;
     } catch (error) {
         // Reset refill flag on error
         metadata.isRefilling = false;
-        await updateMetadata(metadata, cacheKey);
+        await updateMetadata(metadata, cacheKey, env);
         console.error(`Refill error for key ${cacheKey}: ${error.message}`);
         throw error;
     }
 }
 
 // Helper function to trigger full cache system refresh - ASYNCHRONOUS OPERATION
-async function refillCacheSystem(metadata, cacheKey = 'default', params = {}) {
+async function refillCacheSystem(metadata, cacheKey = 'default', params = {}, env) {
     try {
         console.log(`Triggering full cache system refresh for key: ${cacheKey}`);
         
         // First copy buffer to main
-        await copyBufferToMain(metadata, cacheKey);
+        await copyBufferToMain(metadata, cacheKey, env);
         
         // Then refill buffer
-        await refillBufferCache(metadata, cacheKey, params);
+        await refillBufferCache(metadata, cacheKey, params, env);
         
         return metadata;
     } catch (error) {
@@ -516,7 +519,7 @@ function matchesCriteria(imageData, orientation, collectionIds, addPhotoOfTheDay
 // -----------------------------------------------------------
 
 // Fetch image directly from Unsplash API
-async function fetchImageFromUnsplash(params) {
+async function fetchImageFromUnsplash(params, env) {
     const { orientation, collectionIds, addPhotoOfTheDay } = params;
     
     const fetchUrl = new URL('https://api.unsplash.com/photos/random');
@@ -531,7 +534,7 @@ async function fetchImageFromUnsplash(params) {
     // Make the API request
     const response = await fetch(fetchUrl.toString(), {
         headers: {
-            'Authorization': `Client-ID ${ACCESS_KEY}`,
+            'Authorization': `Client-ID ${env.ACCESS_KEY}`,
             'Accept-Version': 'v1'
         }
     });
@@ -568,12 +571,12 @@ const circuitBreaker = {
 };
 
 // Track download with Unsplash
-async function trackDownload(photoId) {
+async function trackDownload(photoId, env) {
     try {
         const downloadUrl = `https://api.unsplash.com/photos/${photoId}/download`;
         await fetch(downloadUrl, {
             headers: {
-                'Authorization': `Client-ID ${ACCESS_KEY}`,
+                'Authorization': `Client-ID ${env.ACCESS_KEY}`,
                 'Accept-Version': 'v1'
             }
         });
@@ -621,18 +624,18 @@ function sanitizeNumber(value) {
 // -----------------------------------------------------------
 
 // Handle cache status request - updated for parameter awareness
-async function handleCacheStatusRequest() {
+async function handleCacheStatusRequest(env) {
     try {
         // Get list of all cache keys from KV store
         // Note: This is a simplification - in practice you'd need pagination for many keys
-        const keys = await NAZKVHUBSTORE.list({ prefix: 'META_' });
+        const keys = await env.NAZKVHUBSTORE.list({ prefix: 'META_' });
         
         const cacheStatuses = {};
         
         // Process each cache
         for (const key of keys.keys) {
             const cacheKey = key.name.replace('META_', '');
-            const metadata = await getOrInitializeMetadata(cacheKey);
+            const metadata = await getOrInitializeMetadata(cacheKey, env);
             
             // Calculate cache fill percentages
             const mainFillPercent = Math.round((metadata.mainCache.count / 30) * 100);
@@ -665,10 +668,10 @@ async function handleCacheStatusRequest() {
 }
 
 // Add this helper function to inspect cache contents
-async function logCacheContents(cacheKey, cacheType = 'main') {
+async function logCacheContents(cacheKey, cacheType = 'main', env) {
     try {
         const cacheStorageKey = cacheType === 'main' ? `MAIN_${cacheKey}` : `BUFFER_${cacheKey}`;
-        const cacheArray = await NAZKVHUBSTORE.get(cacheStorageKey, { type: 'json' });
+        const cacheArray = await env.NAZKVHUBSTORE.get(cacheStorageKey, { type: 'json' });
         
         if (!cacheArray) {
             console.log(`Cache ${cacheStorageKey} not found`);
