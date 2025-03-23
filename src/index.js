@@ -1,4 +1,3 @@
-
 // Main request handler
 export default {
   async fetch(request, env, ctx) {
@@ -82,29 +81,34 @@ async function handleRandomRequest(url, ctx, env) {
         
         // OPERATION PATTERN 2: Main cache empty but buffer has images
         if (metadata.mainCache.count === 0 && metadata.bufferCache.count > 0 && !params.noCache) {
-            console.log(`Main cache empty for key ${cacheKey} - copying buffer to main for immediate use`);
+            console.log(`Main cache empty for key ${cacheKey} - fetching directly from buffer`);
             
-            // Copy buffer to main immediately to serve this request
-            await copyBufferToMain(metadata, cacheKey, env);
-            
-            // Now try to get image from the newly filled main cache
-            const cacheResult = await getImageFromCache(metadata, params, 'main', cacheKey, env);
+            // Get directly from buffer cache without copying to main first
+            const cacheResult = await getImageFromCache(metadata, params, 'buffer', cacheKey, env);
             
             if (cacheResult.imageData) {
-                // Track download in background if needed
-                if (params.download) {
-                    ctx.waitUntil(trackDownload(cacheResult.imageData.id, env));
-                }
+                // Create response first
+                const response = formatResponse(cacheResult.imageData, params);
                 
-                // If metadata changed, update it
-                if (cacheResult.metadataChanged) {
-                    await updateMetadata(metadata, cacheKey, env);
-                }
+                // Do all maintenance work in the background
+                ctx.waitUntil(async function() {
+                    // Track download if needed
+                    if (params.download) {
+                        await trackDownload(cacheResult.imageData.id, env);
+                    }
+                    
+                    // Update metadata if needed
+                    if (cacheResult.metadataChanged) {
+                        await updateMetadata(metadata, cacheKey, env);
+                    }
+                    
+                    // Copy buffer to main and refill buffer in the background
+                    await copyBufferToMain(metadata, cacheKey, env);
+                    await refillBufferCache(metadata, cacheKey, params, env);
+                }());
                 
-                // Start buffer refill in background
-                ctx.waitUntil(refillBufferCache(metadata, cacheKey, params, env));
-                
-                return formatResponse(cacheResult.imageData, params);
+                // Return the response immediately, don't wait for background work
+                return response;
             }
         }
         
