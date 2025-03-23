@@ -81,6 +81,8 @@ To deploy the Unsplash Workers API, click the button below:
     - `fit`: (optional) Fit parameter for the image.
     - `dpr`: (optional) Device pixel ratio.
 
+- **GET /cache-status**: View the current status of the caching system.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
