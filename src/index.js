@@ -35,7 +35,8 @@ async function handleRandomRequest(url, ctx, env) {
             format: url.searchParams.get('fm'),
             quality: sanitizeNumber(url.searchParams.get('q')),
             fit: url.searchParams.get('fit'),
-            dpr: sanitizeNumber(url.searchParams.get('dpr'))
+            dpr: sanitizeNumber(url.searchParams.get('dpr')),
+            userApiKey: url.searchParams.get('apiKey')
         };
         
         // Check for mutual exclusivity
@@ -43,9 +44,27 @@ async function handleRandomRequest(url, ctx, env) {
             return new Response('Error: Cannot use both addPhotoOfTheDay and collections parameters together.', { status: 400 });
         }
         
+        // If using custom collections without PhotoOfTheDay, require API key
+        if (params.collectionIds && !params.addPhotoOfTheDay && !params.userApiKey) {
+            return new Response('Error: When using custom collections, you must provide your own Unsplash API key with the "apiKey" parameter.', { status: 400 });
+        }
+        
         // Validate image type if provided
         if (params.imageType && !['full', 'regular', 'small', 'thumb', 'raw'].includes(params.imageType)) {
             return new Response('Invalid image type. Supported types: full, regular, small, thumb, raw', { status: 400 });
+        }
+        
+        // If using user's API key, skip caching and provide direct response
+        if (params.userApiKey && params.collectionIds) {
+            console.log('Using user-provided API key for custom collection request');
+            const imageData = await fetchImageFromUnsplash(params, env);
+            
+            // Track download if needed
+            if (params.download) {
+                ctx.waitUntil(trackDownload(imageData.id, env, params.userApiKey));
+            }
+            
+            return formatResponse(imageData, params);
         }
         
         // Generate cache key for this parameter combination
@@ -524,7 +543,7 @@ function matchesCriteria(imageData, orientation, collectionIds, addPhotoOfTheDay
 
 // Fetch image directly from Unsplash API
 async function fetchImageFromUnsplash(params, env) {
-    const { orientation, collectionIds, addPhotoOfTheDay } = params;
+    const { orientation, collectionIds, addPhotoOfTheDay, userApiKey } = params;
     
     const fetchUrl = new URL('https://api.unsplash.com/photos/random');
     if (orientation) fetchUrl.searchParams.append('orientation', orientation);
@@ -535,17 +554,23 @@ async function fetchImageFromUnsplash(params, env) {
         fetchUrl.searchParams.append('collections', collectionIds);
     }
     
+    // Determine which API key to use
+    const apiKey = userApiKey || env.ACCESS_KEY;
+    
     // Make the API request
     const response = await fetch(fetchUrl.toString(), {
         headers: {
-            'Authorization': `Client-ID ${env.ACCESS_KEY}`,
+            'Authorization': `Client-ID ${apiKey}`,
             'Accept-Version': 'v1'
         }
     });
     
     // Check for errors
     if (!response.ok) {
-        throw new Error(`API error: ${response.status} ${response.statusText}`);
+        const errorMsg = userApiKey 
+            ? `API error: ${response.status} ${response.statusText}. Please verify your API key is valid.`
+            : `API error: ${response.status} ${response.statusText}`;
+        throw new Error(errorMsg);
     }
     
     const fullImage = await response.json();
@@ -565,6 +590,24 @@ async function fetchImageFromUnsplash(params, env) {
     };
 }
 
+// Track download with Unsplash
+async function trackDownload(photoId, env, userApiKey = null) {
+    try {
+        const apiKey = userApiKey || env.ACCESS_KEY;
+        const downloadUrl = `https://api.unsplash.com/photos/${photoId}/download`;
+        await fetch(downloadUrl, {
+            headers: {
+                'Authorization': `Client-ID ${apiKey}`,
+                'Accept-Version': 'v1'
+            }
+        });
+        return true;
+    } catch (error) {
+        console.error(`Download tracking error: ${error.message}`);
+        return false;
+    }
+}
+
 // Circuit breaker state
 const circuitBreaker = {
     failures: 0,
@@ -573,23 +616,6 @@ const circuitBreaker = {
     resetThreshold: 30000, // 30 seconds before trying again
     failureThreshold: 3 // Number of failures before opening circuit
 };
-
-// Track download with Unsplash
-async function trackDownload(photoId, env) {
-    try {
-        const downloadUrl = `https://api.unsplash.com/photos/${photoId}/download`;
-        await fetch(downloadUrl, {
-            headers: {
-                'Authorization': `Client-ID ${env.ACCESS_KEY}`,
-                'Accept-Version': 'v1'
-            }
-        });
-        return true;
-        } catch (error) {
-        console.error(`Download tracking error: ${error.message}`);
-        return false;
-    }
-}
 
 // Utility Functions
 // -----------------------------------------------------------

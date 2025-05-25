@@ -7,6 +7,7 @@ The Unsplash Workers API is a serverless application built with Cloudflare Worke
 - Fast random image delivery with intelligent caching
 - Parameter-specific cache system for different use cases
 - Support for collections, orientations, and Photo of the Day
+- API key management for custom collections to protect rate limits
 - Dynamic image resizing and formatting options
 - Built-in download tracking compatible with Unsplash attribution
 - Circuit breaker pattern to handle API failures gracefully
@@ -93,6 +94,7 @@ Fetch a random image from Unsplash with optional filtering and formatting.
 | `orientation` | string | Filter by image orientation: `landscape`, `portrait`, or `squarish`. Default: `landscape` |
 | `collections` | string | Comma-separated list of Unsplash collection IDs |
 | `addPhotoOfTheDay` | boolean | When `true`, pulls from Unsplash's Photo of the Day collection |
+| `apiKey` | string | **Required when using custom collections**. Your personal Unsplash API key |
 | `dl` | boolean | When `true`, tracks download with Unsplash and returns direct image URL |
 | `url` | string | Image size to return: `full`, `regular`, `small`, `thumb`, `raw` |
 | `w` | number | Width for dynamic resizing |
@@ -149,9 +151,9 @@ View the current status of all parameter-specific caches in the system.
 https://your-worker.example.workers.dev/random
 ```
 
-### Landscape Image from a Specific Collection
+### Landscape Image from a Specific Collection (requires API key)
 ```
-https://your-worker.example.workers.dev/random?orientation=landscape&collections=1538150
+https://your-worker.example.workers.dev/random?orientation=landscape&collections=1538150&apiKey=your_unsplash_api_key
 ```
 
 ### Portrait Image with Custom Size
