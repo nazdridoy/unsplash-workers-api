@@ -613,8 +613,8 @@ function validateOrientation(orientation) {
 // Sanitize collection IDs parameter
 function sanitizeCollectionIds(collections) {
     if (!collections) return null;
-    // Ensure only numbers and commas are in the collection IDs
-    return collections.replace(/[^0-9,]/g, '');
+    // Ensure only alphanumeric characters and commas are in the collection IDs
+    return collections.replace(/[^a-zA-Z0-9,]/g, '');
 }
 
 // Sanitize numeric parameters
